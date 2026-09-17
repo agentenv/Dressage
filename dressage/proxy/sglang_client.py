@@ -10,6 +10,13 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import httpx
 
+# httpx's default pool (100 connections, unbounded pool wait) silently capped
+# concurrent generations fleet-wide; agents waited in the proxy until their
+# own timeout.  Size the pool for the whole rollout and fail loudly instead.
+_DEFAULT_DATA_PLANE_MAX_CONNECTIONS = 384
+_DEFAULT_DATA_PLANE_MAX_KEEPALIVE_CONNECTIONS = 384
+_DEFAULT_DATA_PLANE_POOL_TIMEOUT_SECONDS = 600.0
+
 
 def _coerce_int_list(values: Any) -> list[int]:
     if not isinstance(values, list):
@@ -165,12 +172,22 @@ class SGLangRouterClient:
         timeout: httpx.Timeout | None = None,
         client: httpx.AsyncClient | None = None,
         return_routed_experts: bool = False,
+        max_connections: int = _DEFAULT_DATA_PLANE_MAX_CONNECTIONS,
+        max_keepalive_connections: int = (
+            _DEFAULT_DATA_PLANE_MAX_KEEPALIVE_CONNECTIONS
+        ),
+        pool_timeout_seconds: float = _DEFAULT_DATA_PLANE_POOL_TIMEOUT_SECONDS,
     ):
         self._router_url = router_url.rstrip("/")
         self._owns_client = client is None
         self._return_routed_experts = return_routed_experts
         self._client = client or httpx.AsyncClient(
-            timeout=timeout or httpx.Timeout(None), trust_env=False
+            timeout=timeout or httpx.Timeout(None, pool=pool_timeout_seconds),
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+            ),
+            trust_env=False,
         )
 
     async def generate(
