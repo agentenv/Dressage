@@ -540,6 +540,28 @@ def _build_sampling_params(
     return sampling_params
 
 
+def _optional_cached_tokens(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_payload(
+    prompt_tokens: int, completion_tokens: int, cached_tokens: int | None
+) -> dict[str, Any]:
+    # SGLang reports prefix-cache reuse as meta_info.cached_tokens (cache
+    # report enabled); OpenAI clients read it from prompt_tokens_details.
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    return usage
+
+
 def _context_overflow_payload(
     *,
     phase: str,
@@ -730,6 +752,9 @@ def create_app(
     session_manager: SessionManager | None = None,
     tokenizer: Any | None = None,
     sglang_client: SGLangRouterClient | None = None,
+    sglang_client_max_connections: int = 384,
+    sglang_client_max_keepalive_connections: int = 384,
+    sglang_client_pool_timeout_seconds: float = 600.0,
     tool_call_parser: ToolCallParser | object = _DEFAULT_TOOL_CALL_PARSER,
     model_tool_call_type: str | None = None,
     tool_call_parse_backend: Literal["local", "sglang_api", "hybrid"] = "sglang_api",
@@ -774,6 +799,20 @@ def create_app(
 
     if context_window is not None and context_window <= 0:
         raise ValueError("context_window must be greater than 0 when provided")
+    if sglang_client_max_connections <= 0:
+        raise ValueError("sglang_client_max_connections must be greater than 0")
+    if sglang_client_max_keepalive_connections < 0:
+        raise ValueError(
+            "sglang_client_max_keepalive_connections must be greater than or "
+            "equal to 0"
+        )
+    if sglang_client_max_keepalive_connections > sglang_client_max_connections:
+        raise ValueError(
+            "sglang_client_max_keepalive_connections must not exceed "
+            "sglang_client_max_connections"
+        )
+    if sglang_client_pool_timeout_seconds <= 0:
+        raise ValueError("sglang_client_pool_timeout_seconds must be greater than 0")
     if (
         not math.isfinite(stream_heartbeat_interval_seconds)
         or stream_heartbeat_interval_seconds < 0
@@ -891,6 +930,9 @@ def create_app(
     sglang_client = sglang_client or SGLangRouterClient(
         sglang_router_url,
         return_routed_experts=use_rollout_routing_replay,
+        max_connections=sglang_client_max_connections,
+        max_keepalive_connections=sglang_client_max_keepalive_connections,
+        pool_timeout_seconds=sglang_client_pool_timeout_seconds,
     )
     generation_controller = GenerationController(
         sglang_client,
@@ -1828,6 +1870,7 @@ def create_app(
         prompt_tokens: int,
         completion_tokens: int,
         response_id: str | None = None,
+        cached_tokens: int | None = None,
     ) -> dict[str, Any]:
         message = _assistant_message(
             content, tool_calls, reasoning_content=reasoning_content
@@ -1840,11 +1883,7 @@ def create_app(
             "choices": [
                 {"index": 0, "message": message, "finish_reason": finish_reason}
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": _usage_payload(prompt_tokens, completion_tokens, cached_tokens),
         }
 
     async def _pseudo_stream_chunks(
@@ -1857,6 +1896,7 @@ def create_app(
         prompt_tokens: int,
         completion_tokens: int,
         include_usage: bool,
+        cached_tokens: int | None = None,
     ):
         created = int(time.time())
 
@@ -1879,11 +1919,9 @@ def create_app(
                 "created": created,
                 "model": model,
                 "choices": [],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                },
+                "usage": _usage_payload(
+                    prompt_tokens, completion_tokens, cached_tokens
+                ),
             }
             return f"data: {json.dumps(data)}\n\n"
 
@@ -2555,6 +2593,9 @@ def create_app(
                 )
 
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        cached_prompt_tokens = _optional_cached_tokens(
+            router_response.meta_info.get("cached_tokens")
+        )
         if stream:
             return StreamingResponse(
                 _pseudo_stream_chunks(
@@ -2567,6 +2608,7 @@ def create_app(
                     prompt_tokens,
                     public_completion_tokens,
                     include_usage,
+                    cached_tokens=cached_prompt_tokens,
                 ),
                 media_type="text/event-stream",
                 headers=_SSE_RESPONSE_HEADERS,
@@ -2582,6 +2624,7 @@ def create_app(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=public_completion_tokens,
                 response_id=response_id,
+                cached_tokens=cached_prompt_tokens,
             )
         )
 
@@ -3079,6 +3122,13 @@ def create_app(
                 "context_window": context_window,
                 "dynamic_max_tokens": dynamic_max_tokens,
                 "use_rollout_routing_replay": use_rollout_routing_replay,
+                "sglang_client_max_connections": sglang_client_max_connections,
+                "sglang_client_max_keepalive_connections": (
+                    sglang_client_max_keepalive_connections
+                ),
+                "sglang_client_pool_timeout_seconds": (
+                    sglang_client_pool_timeout_seconds
+                ),
                 "partial_rollout": partial_rollout,
                 "max_partial_rollout_preempts": max_partial_rollout_preempts,
                 "engine_rebalancing": rebalancing_config.snapshot(),
@@ -3113,6 +3163,24 @@ def parse_args() -> argparse.Namespace:
         "--sglang-router-url",
         default=None,
         help="SGLang Router base URL, e.g. http://localhost:30000",
+    )
+    parser.add_argument(
+        "--sglang-client-max-connections",
+        type=_positive_int,
+        default=384,
+        help="Maximum concurrent Dressage proxy connections to SGLang.",
+    )
+    parser.add_argument(
+        "--sglang-client-max-keepalive-connections",
+        type=_non_negative_int,
+        default=384,
+        help="Maximum idle keepalive connections in the Dressage-to-SGLang pool.",
+    )
+    parser.add_argument(
+        "--sglang-client-pool-timeout-seconds",
+        type=_positive_float,
+        default=600.0,
+        help="Maximum seconds to wait for a Dressage-to-SGLang pool lease.",
     )
     parser.add_argument("--tokenizer-path", required=True, help="HF tokenizer path")
     parser.add_argument("--host", default="0.0.0.0")
@@ -3324,6 +3392,13 @@ def main() -> None:
 
     app = create_app(
         sglang_router_url=args.sglang_router_url,
+        sglang_client_max_connections=args.sglang_client_max_connections,
+        sglang_client_max_keepalive_connections=(
+            args.sglang_client_max_keepalive_connections
+        ),
+        sglang_client_pool_timeout_seconds=(
+            args.sglang_client_pool_timeout_seconds
+        ),
         tokenizer_path=args.tokenizer_path,
         trajectory_store=TrajectoryStore(
             min_group_size=args.min_group_size, group_timeout=args.group_timeout
